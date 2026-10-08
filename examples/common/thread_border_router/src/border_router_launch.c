@@ -641,6 +641,14 @@ static void rcp_failure_handler(void)
 #endif
 }
 
+/* HYP F-OT-011: default when the application provides no first-boot dataset. */
+__attribute__((weak)) bool hyp_otbr_initial_dataset_tlvs(otInstance *instance, otOperationalDatasetTlvs *out)
+{
+    (void)instance;
+    (void)out;
+    return false;
+}
+
 static void ot_br_init(void *ctx)
 {
 #if CONFIG_OPENTHREAD_CLI_WIFI
@@ -655,7 +663,17 @@ static void ot_br_init(void *ctx)
     otOperationalDatasetTlvs dataset;
     otInstance *instance = esp_openthread_get_instance();
     otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
-    ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
+    bool have_dataset = (error == OT_ERROR_NONE);
+    if (!have_dataset) {
+        /* HYP F-OT-011: first boot of this unit. The application chooses the
+         * dataset (channel, Active Timestamp = fleet generation, channel mask);
+         * without an override ESP-IDF forms it from Kconfig with Active
+         * Timestamp 1. A stored dataset is never touched here. */
+        have_dataset = hyp_otbr_initial_dataset_tlvs(instance, &dataset);
+        ESP_LOGI(TAG, "No stored Thread dataset: forming the network from the %s",
+                 have_dataset ? "application's first-boot dataset" : "ESP-IDF Kconfig dataset");
+    }
+    ESP_ERROR_CHECK(esp_openthread_auto_start(have_dataset ? &dataset : NULL));
     post_otbr_event(HYP_OTBR_EVENT_AUTO_START_READY,
                     instance,
                     "auto-start-ready",

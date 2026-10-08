@@ -17,6 +17,7 @@ extern "C" {
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_rcp_update.h"
+#include "openthread/dataset.h"
 #include "openthread/thread.h"
 
 ESP_EVENT_DECLARE_BASE(HYP_OTBR_EVENT);
@@ -42,6 +43,18 @@ typedef struct {
     otDeviceRole role;
     bool ip6_enabled;
 } hyp_otbr_state_event_t;
+
+/*
+ * HYP F-OT-011: the dataset a gateway forms its network with on its very first
+ * boot, when no Active Operational Dataset is stored in NVS yet. Weakly defined
+ * in border_router_launch.c to return false, which keeps ESP-IDF's
+ * esp_openthread_auto_start() Kconfig path (channel, PAN, keys from sdkconfig,
+ * Active Timestamp 1). The application overrides it to ship a chosen Active
+ * Timestamp (the fleet generation) and an explicit channel mask. Called once,
+ * under the OpenThread lock, on the ot_br_init task (internal-RAM stack).
+ * Returns true with *out filled; false to fall back to the Kconfig path.
+ */
+bool hyp_otbr_initial_dataset_tlvs(otInstance *instance, otOperationalDatasetTlvs *out);
 
 void launch_openthread_border_router(const esp_openthread_platform_config_t *config,
                                      const esp_rcp_update_config_t *update_config);

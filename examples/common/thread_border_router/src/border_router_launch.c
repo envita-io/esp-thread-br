@@ -722,11 +722,16 @@ static void ot_task_worker(void *ctx)
     post_ot_init_state_if_changed(true,
                                   esp_openthread_get_instance(),
                                   "esp_openthread_init returned ESP_OK and RCP recovery was not requested");
+    // Initialize border routing features
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    /* HYP: registered under the OpenThread lock. The instance exists from
+     * esp_openthread_init on and the application's internal-RAM workers may
+     * already hold the lock (F-OT-010 / F-REPORT-014 register their own
+     * state-changed callback); two unlocked registrations could pick the same
+     * Notifier slot. */
     ESP_ERROR_CHECK(otSetStateChangedCallback(esp_openthread_get_instance(),
                                               otbr_state_changed_callback,
                                               NULL) == OT_ERROR_NONE ? ESP_OK : ESP_FAIL);
-    // Initialize border routing features
-    esp_openthread_lock_acquire(portMAX_DELAY);
     ESP_ERROR_CHECK(esp_netif_attach(openthread_netif, esp_openthread_netif_glue_init(&s_openthread_platform_config)));
 #if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
     (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);

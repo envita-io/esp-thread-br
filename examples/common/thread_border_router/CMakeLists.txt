@@ -8,4 +8,7 @@ endif()
 idf_component_register(SRC_DIRS "src"
                        INCLUDE_DIRS "include"
                        REQUIRES "${requires}"
+                       # HYP F-RCP-003: the RCP recovery hooks hash the stored H2 images
+                       # and bound their reads with esp_timer.
+                       PRIV_REQUIRES mbedtls esp_timer
 )

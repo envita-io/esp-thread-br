@@ -56,6 +56,21 @@ typedef struct {
  */
 bool hyp_otbr_initial_dataset_tlvs(otInstance *instance, otOperationalDatasetTlvs *out);
 
+/*
+ * HYP F-RCP-003: a run-time failure of an OpenThread / border-router start step
+ * (esp_rcp_update_init, esp_netif_new, esp_openthread_netif_glue_init,
+ * esp_netif_attach, the ot_br_main / ot_br_init task creation,
+ * esp_openthread_border_router_init, esp_openthread_auto_start,
+ * esp_ot_wifi_config_init). Weakly defined in border_router_launch.c as the
+ * stock ESP_ERROR_CHECK abort; the application (rcp_recovery.c) overrides it to
+ * hand the failure to its recovery owner. Called WITHOUT the OpenThread lock
+ * held, on the failing task. If it returns, the failed start path ends: nothing
+ * further is launched, ot_br_init ends, and ot_br_main runs the mainloop without
+ * the step. otSetStateChangedCallback (a compile-time slot table: a programming
+ * error) still aborts.
+ */
+void hyp_otbr_start_failed(const char *step, esp_err_t err);
+
 void launch_openthread_border_router(const esp_openthread_platform_config_t *config,
                                      const esp_rcp_update_config_t *update_config);
 

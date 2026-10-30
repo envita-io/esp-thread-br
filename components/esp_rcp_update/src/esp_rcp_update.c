@@ -5,6 +5,7 @@
  */
 
 #include "esp_rcp_update.h"
+#include "rcp_recovery.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -91,21 +92,29 @@ static esp_err_t seek_to_subfile(FILE *fp, esp_rcp_filetag_t tag, esp_rcp_subfil
 
 esp_err_t esp_rcp_load_version_in_storage(char *version_str, size_t size)
 {
+    if (version_str == NULL || size < 2) return ESP_ERR_INVALID_ARG;
+    memset(version_str, 0, size);
     char fullpath[RCP_FILENAME_MAX_SIZE];
     int8_t update_seq = esp_rcp_get_update_seq();
-
-    sprintf(fullpath, "%s_%d/" ESP_RCP_IMAGE_FILENAME, s_handle.update_config.firmware_dir, update_seq);
+    int length = snprintf(fullpath, sizeof(fullpath), "%s_%d/" ESP_RCP_IMAGE_FILENAME,
+                          s_handle.update_config.firmware_dir, update_seq);
+    if (length < 0 || (size_t)length >= sizeof(fullpath)) return ESP_ERR_INVALID_ARG;
     FILE *fp = fopen(fullpath, "r");
-    if (fp == NULL) {
-        return ESP_ERR_NOT_FOUND;
-    }
+    if (fp == NULL) return ESP_ERR_NOT_FOUND;
+
+    /* F-RCP-003/R5: the parser may fail on a damaged but openable image.
+     * Every path after fopen owns one FILE until this common cleanup. */
     esp_rcp_subfile_info_t version_info;
-    ESP_RETURN_ON_ERROR(seek_to_subfile(fp, FILETAG_RCP_VERSION, &version_info), TAG, "Failed to find version subfile");
-    memset(version_str, 0, size);
-    int read_size = size < version_info.size ? size : version_info.size;
-    fread(version_str, 1, read_size, fp);
-    fclose(fp);
-    return ESP_OK;
+    esp_err_t err = seek_to_subfile(fp, FILETAG_RCP_VERSION, &version_info);
+    if (err == ESP_OK) {
+        size_t read_size = size - 1 < version_info.size ? size - 1 : version_info.size;
+        if (read_size == 0 || fread(version_str, 1, read_size, fp) != read_size) {
+            memset(version_str, 0, size);
+            err = ESP_FAIL;
+        }
+    }
+    if (fclose(fp) != 0 && err == ESP_OK) err = ESP_FAIL;
+    return err;
 }
 
 static esp_loader_error_t flash_binary(FILE *firmware, size_t size, size_t address)
@@ -114,6 +123,8 @@ static esp_loader_error_t flash_binary(FILE *firmware, size_t size, size_t addre
     static uint8_t payload[1024];
 
     ESP_LOGI(TAG, "Erasing flash (this may take a while)...");
+    if (hyp_rcp_recovery_operation_expired() || size == 0 || size > 2U * 1024U * 1024U)
+        return ESP_LOADER_ERROR_TIMEOUT;
     err = esp_loader_flash_start(address, size, sizeof(payload));
     if (err != ESP_LOADER_SUCCESS) {
         ESP_LOGE(TAG, "Erasing flash failed with error %d.", err);
@@ -127,7 +138,8 @@ static esp_loader_error_t flash_binary(FILE *firmware, size_t size, size_t addre
     ESP_LOGI(TAG, "binary_size %u", binary_size);
     while (size > 0) {
         size_t to_read = size < sizeof(payload) ? size : sizeof(payload);
-        fread(payload, 1, to_read, firmware);
+        if (hyp_rcp_recovery_operation_expired() || fread(payload, 1, to_read, firmware) != to_read)
+            return ESP_LOADER_ERROR_TIMEOUT;
 
         err = esp_loader_flash_write(payload, to_read);
         if (err != ESP_LOADER_SUCCESS) {
@@ -146,6 +158,7 @@ static esp_loader_error_t flash_binary(FILE *firmware, size_t size, size_t addre
 
     ESP_LOGI(TAG, "Finished programming");
 
+    if (hyp_rcp_recovery_operation_expired()) return ESP_LOADER_ERROR_TIMEOUT;
     err = esp_loader_flash_verify();
     if (err != ESP_LOADER_SUCCESS) {
         ESP_LOGE(TAG, "MD5 does not match. err: %d", err);
@@ -232,6 +245,7 @@ static esp_err_t esp_rcp_boot_pin_mux(void)
 
 esp_err_t esp_rcp_update(void)
 {
+    if (hyp_rcp_recovery_operation_expired()) return ESP_ERR_TIMEOUT;
     ESP_RETURN_ON_FALSE(s_handle.update_config.rcp_type != RCP_TYPE_INVALID, ESP_ERR_INVALID_STATE, TAG,
                         "RCP update not initialized");
 
@@ -281,6 +295,7 @@ esp_err_t esp_rcp_update(void)
     int num_flash_binaries = subfile.size / sizeof(rcp_flash_arg_t);
 
     for (int i = 0; i < num_flash_binaries; i++) {
+        if (hyp_rcp_recovery_operation_expired()) { ret = ESP_ERR_TIMEOUT; goto cleanup; }
         rcp_flash_arg_t flash_args;
         if (fread(&flash_args, 1, sizeof(flash_args), fp) != sizeof(flash_args)) {
             ESP_LOGE(TAG, "Failed to read RCP flash arguments from %s", fullpath);
@@ -296,6 +311,7 @@ esp_err_t esp_rcp_update(void)
         }
         while (flash_binary(fp, subfile.size, flash_args.offset) != ESP_LOADER_SUCCESS) {
             ESP_LOGW(TAG, "Failed to flash %s, retrying...", fullpath);
+            if (hyp_rcp_recovery_operation_expired()) { ret = ESP_ERR_TIMEOUT; goto cleanup; }
             num_retry++;
             if (num_retry > RCP_UPDATE_MAX_RETRY) {
                 ESP_LOGE(TAG, "Failed to update RCP after %d retries", RCP_UPDATE_MAX_RETRY);

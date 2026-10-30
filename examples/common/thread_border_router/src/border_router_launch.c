@@ -8,6 +8,7 @@
 #include "border_router_launch.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -28,11 +29,14 @@
 #include "esp_rcp_firmware.h"
 #endif
 #include "esp_system.h"
+#include "esp_timer.h"
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
 #endif
 #include "esp_rcp_update.h"
 #include "esp_vfs_eventfd.h"
+#include "rcp_recovery.h"
+#include "thread_migrate.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "openthread/backbone_router_ftd.h"
@@ -47,6 +51,7 @@
 #include "openthread/platform/radio.h"
 #include "openthread/tasklet.h"
 #include "openthread/thread_ftd.h"
+#include "mbedtls/sha256.h"
 #include "nvs.h"
 
 #if CONFIG_OPENTHREAD_CLI_WIFI
@@ -138,7 +143,7 @@ static bool post_otbr_event(int32_t event_id, otInstance *instance, const char *
              (int)state.role,
              reason ? reason : "no reason");
 
-    err = esp_event_post(HYP_OTBR_EVENT, event_id, &state, sizeof(state), portMAX_DELAY);
+    err = esp_event_post(HYP_OTBR_EVENT, event_id, &state, sizeof(state), pdMS_TO_TICKS(100));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to post OpenThread %s event: %s", name, esp_err_to_name(err));
         return false;
@@ -220,7 +225,6 @@ static void otbr_state_changed_callback(otChangedFlags changed_flags, void *ctx)
 #define HYP_RCP_RECOVERY_INITIAL_DELAY_MS 5000
 #define HYP_RCP_RECOVERY_MAX_DELAY_MS 60000
 
-static bool s_rcp_recovery_restart_requested;
 
 static esp_err_t open_rcp_nvs(nvs_handle_t *handle)
 {
@@ -386,19 +390,99 @@ static void wait_for_pending_ota_verification(const char *reason)
              HYP_RCP_RESTART_OTA_WAIT_MS / 1000);
 }
 
+/* HYP F-RCP-003: the application's RCP recovery owner (main/utils/rcp_recovery.c)
+ * owns scheduling, persistence and drain; these hooks give it the RCP image state
+ * private to this file. */
+static esp_err_t select_next_rcp_image_if_available(const char *reason);
+
+static bool hyp_rcp_image_identity(uint8_t out[32])
+{
+    mbedtls_sha256_context hash;
+    mbedtls_sha256_init(&hash);
+    bool valid = mbedtls_sha256_starts(&hash, 0) == 0;
+    int64_t deadline = esp_timer_get_time() + 60000000LL;
+    uint8_t chunk[512];
+    /* Fixed slot order: selecting the alternate slot must not reset a streak. */
+    for (int slot = 0; valid && slot < 2; slot++) {
+        char path[RCP_FILENAME_MAX_SIZE];
+        int length = snprintf(path, sizeof(path), "%s_%d/" ESP_RCP_IMAGE_FILENAME,
+                              esp_rcp_get_firmware_dir(), slot);
+        if (length < 0 || (size_t)length >= sizeof(path)) { valid = false; break; }
+        errno = 0;
+        FILE *fp = fopen(path, "rb");
+        if (fp == NULL && errno != ENOENT) { valid = false; break; }
+        uint8_t present = fp != NULL;
+        valid = mbedtls_sha256_update(&hash, &present, sizeof(present)) == 0;
+        if (fp == NULL) continue;
+        if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); valid = false; break; }
+        long size = ftell(fp);
+        if (size < 0 || size > 2 * 1024 * 1024 || fseek(fp, 0, SEEK_SET) != 0) {
+            fclose(fp); valid = false; break;
+        }
+        /* Include the length so boundaries between two files are unambiguous. */
+        uint32_t file_size = (uint32_t)size;
+        valid = valid && mbedtls_sha256_update(&hash, (const uint8_t *)&file_size, sizeof(file_size)) == 0;
+        while (valid && size > 0) {
+            size_t read_size = (size_t)size < sizeof(chunk) ? (size_t)size : sizeof(chunk);
+            if (esp_timer_get_time() >= deadline || fread(chunk, 1, read_size, fp) != read_size) {
+                valid = false; break;
+            }
+            valid = mbedtls_sha256_update(&hash, chunk, read_size) == 0;
+            size -= (long)read_size;
+        }
+        fclose(fp);
+    }
+    if (valid) valid = mbedtls_sha256_finish(&hash, out) == 0;
+    mbedtls_sha256_free(&hash);
+    return valid;
+}
+
+static bool hyp_rcp_set_pending_verified(bool pending)
+{
+    set_rcp_recovery_pending(pending);
+    return rcp_recovery_pending() == pending;
+}
+
+static bool hyp_rcp_preflight_probe(void)
+{
+    char version[RCP_VERSION_MAX_SIZE] = {0};
+    esp_err_t err = esp_rcp_load_version_in_storage(version, sizeof(version));
+    if (err != ESP_OK) {
+        (void)select_next_rcp_image_if_available("preflight recovery image missing");
+        err = esp_rcp_load_version_in_storage(version, sizeof(version));
+    }
+    if (err != ESP_OK || hyp_rcp_recovery_operation_expired()) return false;
+    err = esp_rcp_update();
+    if (err != ESP_OK || hyp_rcp_recovery_operation_expired()) return false;
+    esp_rcp_mark_image_verified(true);
+    save_confirmed_rcp_version(version);
+    return hyp_rcp_set_pending_verified(false);
+}
+
+static const hyp_rcp_recovery_hooks_t s_hyp_rcp_hooks = {
+    .image_identity = hyp_rcp_image_identity,
+    .preflight_probe = hyp_rcp_preflight_probe,
+    .set_pending = hyp_rcp_set_pending_verified,
+    .wait_pending_ota = wait_for_pending_ota_verification,
+};
+
+static void hyp_rcp_post_failed_state(void)
+{
+    hyp_otbr_state_event_t state = { .role = OT_DEVICE_ROLE_DISABLED, .ip6_enabled = false };
+    /* The failed OT context cannot safely call into its instance again. These
+     * events carry a disabled snapshot and bound the queue wait. */
+    (void)esp_event_post(HYP_OTBR_EVENT, HYP_OTBR_EVENT_PARENT_NOT_READY,
+                         &state, sizeof(state), pdMS_TO_TICKS(100));
+    (void)esp_event_post(HYP_OTBR_EVENT, HYP_OTBR_EVENT_NOT_READY,
+                         &state, sizeof(state), pdMS_TO_TICKS(100));
+    (void)esp_event_post(HYP_OTBR_EVENT, HYP_OTBR_EVENT_INIT_NOT_READY,
+                         &state, sizeof(state), pdMS_TO_TICKS(100));
+}
+
 static void request_rcp_recovery_restart(const char *reason)
 {
-    if (s_rcp_recovery_restart_requested) {
-        vTaskDelay(portMAX_DELAY);
-    }
-
-    s_rcp_recovery_restart_requested = true;
-    ESP_LOGE(TAG, "H2 RCP recovery requested: %s", reason ? reason : "unknown reason");
-    set_rcp_recovery_pending(true);
-    wait_for_pending_ota_verification("H2 RCP recovery needs a restart");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    esp_restart();
-    vTaskDelay(portMAX_DELAY);
+    hyp_rcp_post_failed_state();
+    hyp_rcp_recovery_runtime_failure(reason);
 }
 
 static void start_rcp_recovery_if_needed(const char *reason)
@@ -551,50 +635,7 @@ static bool current_rcp_image_needs_preflight_update(void)
     return false;
 }
 
-static void rcp_recovery_task(void *ctx)
-{
-    uint32_t delay_ms = HYP_RCP_RECOVERY_INITIAL_DELAY_MS;
-    uint32_t attempt = 0;
 
-    ESP_LOGW(TAG, "H2 RCP recovery task started; OpenThread will start after H2 is flashed successfully");
-
-    while (true) {
-        char internal_version[RCP_VERSION_MAX_SIZE] = {0};
-        esp_err_t err;
-
-        attempt++;
-        err = esp_rcp_load_version_in_storage(internal_version, sizeof(internal_version));
-        if (err != ESP_OK) {
-            (void)select_next_rcp_image_if_available("H2 RCP recovery current image is missing");
-            err = esp_rcp_load_version_in_storage(internal_version, sizeof(internal_version));
-        }
-
-        if (err == ESP_OK) {
-            ESP_LOGW(TAG, "H2 RCP recovery attempt %lu, image version: %s", attempt, internal_version);
-        } else {
-            ESP_LOGE(TAG, "H2 RCP recovery attempt %lu: no RCP image found in storage", attempt);
-            goto retry;
-        }
-
-        err = esp_rcp_update();
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "H2 RCP recovery succeeded; restarting to launch OpenThread");
-            esp_rcp_mark_image_verified(true);
-            save_confirmed_rcp_version(internal_version);
-            set_rcp_recovery_pending(false);
-            /* F-RCP-002 */
-            wait_for_pending_ota_verification("H2 RCP recovery finished");
-            vTaskDelay(pdMS_TO_TICKS(300));
-            esp_restart();
-        }
-
-        ESP_LOGE(TAG, "H2 RCP recovery attempt %lu failed: %s; retrying in %lu ms",
-                 attempt, esp_err_to_name(err), delay_ms);
-retry:
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        delay_ms = delay_ms < HYP_RCP_RECOVERY_MAX_DELAY_MS / 2 ? delay_ms * 2 : HYP_RCP_RECOVERY_MAX_DELAY_MS;
-    }
-}
 
 static void update_rcp(void)
 {
@@ -641,6 +682,14 @@ static void rcp_failure_handler(void)
 #endif
 }
 
+/* HYP F-RCP-003: default when the application does not own start failures:
+ * the stock abort (panic reset), exactly as before. */
+__attribute__((weak)) void hyp_otbr_start_failed(const char *step, esp_err_t err)
+{
+    ESP_LOGE(TAG, "OpenThread border router start step %s failed", step);
+    ESP_ERROR_CHECK(err);
+}
+
 /* HYP F-OT-011: default when the application provides no first-boot dataset. */
 __attribute__((weak)) bool hyp_otbr_initial_dataset_tlvs(otInstance *instance, otOperationalDatasetTlvs *out)
 {
@@ -649,17 +698,40 @@ __attribute__((weak)) bool hyp_otbr_initial_dataset_tlvs(otInstance *instance, o
     return false;
 }
 
+/* HYP F-RCP-003: a run-time start failure (resources, NVS, the RCP behind
+ * OpenThread) is handed to hyp_otbr_start_failed() WITHOUT the OpenThread lock
+ * held; if that returns, the failed start path ends and the mainloop (if it
+ * runs) keeps running without the step. */
+static bool ot_start_step_ok(esp_err_t err, const char *step, bool release_ot_lock)
+{
+    if (err == ESP_OK) {
+        return true;
+    }
+    if (release_ot_lock) {
+        esp_openthread_lock_release();
+    }
+    ESP_LOGE(TAG, "OpenThread start step %s failed: %s", step, esp_err_to_name(err));
+    hyp_otbr_start_failed(step, err);
+    return false;
+}
+
 static void ot_br_init(void *ctx)
 {
 #if CONFIG_OPENTHREAD_CLI_WIFI
-    ESP_ERROR_CHECK(esp_ot_wifi_config_init());
+    if (!ot_start_step_ok(esp_ot_wifi_config_init(), "esp_ot_wifi_config_init", false)) {
+        vTaskDelete(NULL);
+        return;
+    }
 #endif
 #if CONFIG_OPENTHREAD_BR_AUTO_START
     // Start OpenThread Border Router without blocking on any specific backhaul.
     // Whichever uplink (Wi‐Fi / Ethernet / PPP) becomes available will be used by the system.
     esp_openthread_lock_acquire(portMAX_DELAY);
     esp_openthread_set_backbone_netif(openthread_netif);
-    ESP_ERROR_CHECK(esp_openthread_border_router_init());
+    if (!ot_start_step_ok(esp_openthread_border_router_init(), "esp_openthread_border_router_init", true)) {
+        vTaskDelete(NULL);
+        return;
+    }
     otOperationalDatasetTlvs dataset;
     otInstance *instance = esp_openthread_get_instance();
     otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
@@ -673,7 +745,11 @@ static void ot_br_init(void *ctx)
         ESP_LOGI(TAG, "No stored Thread dataset: forming the network from the %s",
                  have_dataset ? "application's first-boot dataset" : "ESP-IDF Kconfig dataset");
     }
-    ESP_ERROR_CHECK(esp_openthread_auto_start(have_dataset ? &dataset : NULL));
+    if (!ot_start_step_ok(esp_openthread_auto_start(have_dataset ? &dataset : NULL),
+                          "esp_openthread_auto_start", true)) {
+        vTaskDelete(NULL);
+        return;
+    }
     post_otbr_event(HYP_OTBR_EVENT_AUTO_START_READY,
                     instance,
                     "auto-start-ready",
@@ -701,7 +777,10 @@ static void ot_task_worker(void *ctx)
     s_otbr_ready_reported = false;
     s_ot_parent_ready_reported = false;
 
-    assert(openthread_netif != NULL);
+    if (!ot_start_step_ok(openthread_netif != NULL ? ESP_OK : ESP_ERR_NO_MEM, "esp_netif_new", false)) {
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Initialize the OpenThread stack
     esp_openthread_register_rcp_failure_handler(rcp_failure_handler);
@@ -728,11 +807,25 @@ static void ot_task_worker(void *ctx)
      * esp_openthread_init on and the application's internal-RAM workers may
      * already hold the lock (F-OT-010 / F-REPORT-014 register their own
      * state-changed callback); two unlocked registrations could pick the same
-     * Notifier slot. */
+     * Notifier slot. Only a full, compile-time sized slot table fails this:
+     * a programming error, so it still aborts. */
     ESP_ERROR_CHECK(otSetStateChangedCallback(esp_openthread_get_instance(),
                                               otbr_state_changed_callback,
                                               NULL) == OT_ERROR_NONE ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(esp_netif_attach(openthread_netif, esp_openthread_netif_glue_init(&s_openthread_platform_config)));
+    /* HYP F-RCP-003: glue/netif allocation failure. Without the glue no
+     * host traffic reaches Thread: skip the border router start, keep the
+     * mainloop, and let the application recover. The glue is checked on its
+     * own: it is NULL when its queue, eventfd or workflow could not be set up,
+     * and esp_netif_attach() dereferences it before it can return an error
+     * (ESP-IDF 5.5.5 esp_netif_lwip.c) - a crash with the OT lock held,
+     * outside the drain and the reset budget. */
+    void *hyp_ot_glue = esp_openthread_netif_glue_init(&s_openthread_platform_config);
+    if (!ot_start_step_ok(hyp_ot_glue != NULL ? ESP_OK : ESP_FAIL, "esp_openthread_netif_glue_init", true)) {
+        goto run_mainloop;
+    }
+    if (!ot_start_step_ok(esp_netif_attach(openthread_netif, hyp_ot_glue), "esp_netif_attach", true)) {
+        goto run_mainloop;
+    }
 #if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
     (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);
 #endif
@@ -745,10 +838,16 @@ static void ot_task_worker(void *ctx)
 #endif
     esp_openthread_lock_release();
 
-    ESP_ERROR_CHECK(xTaskCreate(ot_br_init, "ot_br_init", 6144,
-                                NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    (void)ot_start_step_ok(xTaskCreate(ot_br_init, "ot_br_init", 6144,
+                                       NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM,
+                           "xTaskCreate(ot_br_init)", false);
+run_mainloop:
     // Run the main loop
     esp_openthread_launch_mainloop();
+    if (!thread_migrate_quiesce()) {
+        hyp_rcp_recovery_runtime_failure("OpenThread post drain timed out");
+        return; /* recovery owns retained resources even if a hook returns */
+    }
     post_ot_parent_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
     post_otbr_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
     post_ot_init_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
@@ -769,11 +868,14 @@ void launch_openthread_border_router(const esp_openthread_platform_config_t *pla
     s_openthread_platform_config = *platform_config;
 
 #if CONFIG_AUTO_UPDATE_RCP
-    ESP_ERROR_CHECK(esp_rcp_update_init(update_config));
+    /* HYP F-RCP-003: this runs on the application's task, before OpenThread:
+     * after a failure nothing is launched and the caller continues. */
+    if (!ot_start_step_ok(esp_rcp_update_init(update_config), "esp_rcp_update_init", false)) {
+        return;
+    }
+    hyp_rcp_recovery_start(&s_hyp_rcp_hooks);
     if (current_rcp_image_needs_preflight_update()) {
-        if (xTaskCreate(rcp_recovery_task, "h2_rcp_recovery", 8192, NULL, 5, NULL) != pdPASS) {
-            request_rcp_recovery_restart("failed to create H2 RCP recovery task");
-        }
+        hyp_rcp_recovery_request(true);
         return;
     }
 #else
@@ -784,7 +886,8 @@ void launch_openthread_border_router(const esp_openthread_platform_config_t *pla
      * builds its own mainloop task here rather than going through
      * esp_openthread_start(), which was the only consumer of that Kconfig entry,
      * so the setting had no effect on this path. The stack size stays explicit. */
-    ESP_ERROR_CHECK(xTaskCreate(ot_task_worker, "ot_br_main", 8192,
-                                xTaskGetCurrentTaskHandle(),
-                                CONFIG_OPENTHREAD_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    (void)ot_start_step_ok(xTaskCreate(ot_task_worker, "ot_br_main", 8192,
+                                       xTaskGetCurrentTaskHandle(),
+                                       CONFIG_OPENTHREAD_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM,
+                           "xTaskCreate(ot_br_main)", false);
 }
